@@ -1,0 +1,346 @@
+
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Camera, Car, Download, FileUp, Pencil, Plus, Save, Search, Trash2, X } from "lucide-react";
+
+const STORAGE_KEY = "model-car-ocr-catalog-v1";
+const emptyForm = {
+  id: "",
+  make: "",
+  model: "",
+  vehicleYear: "",
+  modelProductionYear: "",
+  scale: "",
+  modelManufacturer: "",
+  notes: "",
+  rawOcr: "",
+  createdAt: "",
+  updatedAt: "",
+};
+
+const knownMakes = [
+  "Abarth", "Alfa Romeo", "Aston Martin", "Audi", "Bentley", "BMW", "Bugatti",
+  "Buick", "Cadillac", "Chevrolet", "Chrysler", "Citroen", "Dacia", "Dodge",
+  "Ferrari", "Fiat", "Ford", "Honda", "Hyundai", "Jaguar", "Jeep", "Kia",
+  "Lamborghini", "Lancia", "Land Rover", "Lexus", "Lotus", "Maserati", "Mazda",
+  "McLaren", "Mercedes-Benz", "Mercedes", "Mini", "Mitsubishi", "Nissan", "Opel",
+  "Peugeot", "Plymouth", "Pontiac", "Porsche", "Renault", "Rolls-Royce", "Saab",
+  "Seat", "Skoda", "Subaru", "Suzuki", "Tesla", "Toyota", "Volkswagen", "Volvo"
+];
+
+const scaleManufacturers = [
+  "Hot Wheels", "Matchbox", "Majorette", "Bburago", "Maisto", "Corgi", "Dinky",
+  "Minichamps", "Kyosho", "Norev", "Schuco", "Solido", "Tomica", "Autoart", "Welly"
+];
+
+function normalizeText(text) {
+  return String(text || "").replace(/[|]/g, "I").replace(/\s+/g, " ").trim();
+}
+
+function parseOcr(text) {
+  const clean = normalizeText(text);
+  const upper = clean.toUpperCase();
+
+  const make = knownMakes.find((x) => upper.includes(x.toUpperCase())) || "";
+  const modelMaker = scaleManufacturers.find((x) => upper.includes(x.toUpperCase())) || "";
+  const scaleMatch = clean.match(/(?:scale\s*[:\-]?\s*)?1\s*[:/]\s*(\d{1,3})/i);
+  const years = [...clean.matchAll(/\b(19[2-9]\d|20[0-3]\d)\b/g)].map((m) => m[1]);
+
+  let vehicleYear = years[0] || "";
+  let modelProductionYear = years[1] || "";
+  const copyrightYear = clean.match(/(?:©|copyright|made\s+in)\D{0,15}(19\d{2}|20\d{2})/i);
+  if (copyrightYear) {
+    modelProductionYear = copyrightYear[1];
+    vehicleYear = years.find((y) => y !== copyrightYear[1]) || vehicleYear;
+  }
+
+  let model = "";
+  if (make) {
+    const escaped = make.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const afterMake = clean.match(new RegExp(`${escaped}\\s+([A-Za-z0-9][A-Za-z0-9 .\\-]{1,30})`, "i"));
+    if (afterMake) {
+      model = afterMake[1]
+        .split(/\b(?:scale|made|copyright|©|1\s*[:/]|19\d{2}|20\d{2})\b/i)[0]
+        .trim();
+    }
+  }
+
+  return {
+    make,
+    model,
+    vehicleYear,
+    modelProductionYear,
+    scale: scaleMatch ? `1:${scaleMatch[1]}` : "",
+    modelManufacturer: modelMaker,
+  };
+}
+
+function csvEscape(value) {
+  const text = String(value ?? "");
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function parseCsv(text) {
+  const rows = [];
+  let row = [], value = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') { value += '"'; i++; }
+      else if (c === '"') quoted = false;
+      else value += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ',') { row.push(value); value = ""; }
+    else if (c === '\n') { row.push(value.replace(/\r$/, "")); rows.push(row); row = []; value = ""; }
+    else value += c;
+  }
+  row.push(value.replace(/\r$/, ""));
+  if (row.some(Boolean)) rows.push(row);
+  return rows;
+}
+
+function uid() {
+  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+export default function App() {
+  const [cars, setCars] = useState([]);
+  const [form, setForm] = useState(emptyForm);
+  const [query, setQuery] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [imageUrl, setImageUrl] = useState("");
+  const [ocrStatus, setOcrStatus] = useState("");
+  const [ocrProgress, setOcrProgress] = useState(0);
+  const [message, setMessage] = useState("");
+  const importRef = useRef(null);
+
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+      if (Array.isArray(saved)) setCars(saved);
+    } catch { setMessage("Saved data could not be read."); }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(cars));
+  }, [cars]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return cars;
+    return cars.filter((c) => Object.values(c).some((v) => String(v).toLowerCase().includes(q)));
+  }, [cars, query]);
+
+  function update(name, value) { setForm((f) => ({ ...f, [name]: value })); }
+
+  function newEntry() {
+    setForm(emptyForm);
+    setImageUrl("");
+    setOcrStatus("");
+    setOcrProgress(0);
+    setEditing(true);
+  }
+
+  function editEntry(car) {
+    setForm({ ...emptyForm, ...car });
+    setImageUrl("");
+    setOcrStatus("");
+    setOcrProgress(0);
+    setEditing(true);
+  }
+
+  async function ensureTesseract() {
+    if (window.Tesseract) return window.Tesseract;
+    await new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+      script.onload = resolve;
+      script.onerror = () => reject(new Error("OCR library could not be loaded."));
+      document.head.appendChild(script);
+    });
+    return window.Tesseract;
+  }
+
+  async function scanImage(file) {
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    setImageUrl(url);
+    setOcrStatus("Loading OCR engine…");
+    setOcrProgress(0);
+    try {
+      const Tesseract = await ensureTesseract();
+      const result = await Tesseract.recognize(file, "eng", {
+        logger: (m) => {
+          setOcrStatus(m.status ? m.status.replace(/\b\w/g, (x) => x.toUpperCase()) : "Scanning…");
+          if (typeof m.progress === "number") setOcrProgress(Math.round(m.progress * 100));
+        },
+      });
+      const rawOcr = result?.data?.text || "";
+      const parsed = parseOcr(rawOcr);
+      setForm((f) => ({
+        ...f,
+        rawOcr,
+        make: parsed.make || f.make,
+        model: parsed.model || f.model,
+        vehicleYear: parsed.vehicleYear || f.vehicleYear,
+        modelProductionYear: parsed.modelProductionYear || f.modelProductionYear,
+        scale: parsed.scale || f.scale,
+        modelManufacturer: parsed.modelManufacturer || f.modelManufacturer,
+      }));
+      setOcrStatus("Scan complete. Review every field before saving.");
+      setOcrProgress(100);
+    } catch (e) {
+      setOcrStatus(e?.message || "OCR failed. You can still enter the fields manually.");
+    }
+  }
+
+  function saveEntry(e) {
+    e.preventDefault();
+    const now = new Date().toISOString();
+    const record = {
+      ...form,
+      id: form.id || uid(),
+      createdAt: form.createdAt || now,
+      updatedAt: now,
+    };
+    setCars((list) => form.id ? list.map((x) => x.id === form.id ? record : x) : [record, ...list]);
+    setEditing(false);
+    setMessage(form.id ? "Entry updated." : "Model car saved on this device.");
+  }
+
+  function removeEntry(id) {
+    if (window.confirm("Delete this model car entry?")) setCars((list) => list.filter((x) => x.id !== id));
+  }
+
+  function exportCsv() {
+    const headers = ["id", "make", "model", "vehicleYear", "modelProductionYear", "scale", "modelManufacturer", "notes", "rawOcr", "createdAt", "updatedAt"];
+    const content = [headers.join(","), ...cars.map((car) => headers.map((h) => csvEscape(car[h])).join(","))].join("\r\n");
+    const blob = new Blob(["\ufeff" + content], { type: "text/csv;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `model-car-catalog-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  async function importCsv(file) {
+    if (!file) return;
+    try {
+      const rows = parseCsv(await file.text());
+      const headers = rows.shift()?.map((x) => x.trim()) || [];
+      if (!headers.includes("make") || !headers.includes("model")) throw new Error("CSV must contain make and model columns.");
+      const imported = rows.filter((r) => r.some(Boolean)).map((row) => {
+        const obj = { ...emptyForm };
+        headers.forEach((h, i) => { if (h in obj) obj[h] = row[i] || ""; });
+        obj.id = obj.id || uid();
+        obj.createdAt = obj.createdAt || new Date().toISOString();
+        obj.updatedAt = new Date().toISOString();
+        return obj;
+      });
+      setCars((current) => {
+        const map = new Map(current.map((x) => [x.id, x]));
+        imported.forEach((x) => map.set(x.id, x));
+        return [...map.values()];
+      });
+      setMessage(`${imported.length} entries imported.`);
+    } catch (e) { setMessage(e?.message || "CSV import failed."); }
+    if (importRef.current) importRef.current.value = "";
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100">
+      <header className="sticky top-0 z-20 border-b border-slate-800 bg-slate-950/95 backdrop-blur">
+        <div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-4 py-4">
+          <div className="flex items-center gap-3">
+            <div className="rounded-2xl bg-amber-400 p-2.5 text-slate-950"><Car size={24} /></div>
+            <div><h1 className="text-xl font-bold">Model Car Catalog</h1><p className="text-xs text-slate-400">Private, local-first collection</p></div>
+          </div>
+          <button onClick={newEntry} className="flex items-center gap-2 rounded-xl bg-amber-400 px-4 py-2.5 font-semibold text-slate-950 shadow-lg shadow-amber-400/10"><Plus size={18}/> Add</button>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-5xl px-4 py-6">
+        {message && <div className="mb-4 flex items-center justify-between rounded-xl border border-emerald-700/50 bg-emerald-950/50 px-4 py-3 text-sm text-emerald-200"><span>{message}</span><button onClick={() => setMessage("")}><X size={16}/></button></div>}
+
+        <section className="mb-5 grid gap-3 sm:grid-cols-[1fr_auto_auto]">
+          <label className="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-3">
+            <Search size={18} className="text-slate-400"/>
+            <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search make, model, year, scale…" className="w-full bg-transparent py-3 outline-none" />
+          </label>
+          <button onClick={() => importRef.current?.click()} className="flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 font-medium"><FileUp size={18}/> Import CSV</button>
+          <input ref={importRef} type="file" accept=".csv,text/csv" className="hidden" onChange={(e) => importCsv(e.target.files?.[0])}/>
+          <button onClick={exportCsv} disabled={!cars.length} className="flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 font-medium disabled:opacity-40"><Download size={18}/> Export CSV</button>
+        </section>
+
+        <div className="mb-3 flex items-center justify-between text-sm text-slate-400"><span>{filtered.length} of {cars.length} model cars</span><span>Stored only in this browser</span></div>
+
+        {!filtered.length ? (
+          <button onClick={newEntry} className="w-full rounded-3xl border border-dashed border-slate-700 bg-slate-900/50 p-10 text-center">
+            <Camera className="mx-auto mb-3 text-amber-400" size={38}/><div className="text-lg font-semibold">Scan your first model car</div><div className="mt-1 text-sm text-slate-400">Photograph the underside or enter it manually.</div>
+          </button>
+        ) : (
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {filtered.map((car) => (
+              <article key={car.id} className="rounded-2xl border border-slate-800 bg-slate-900 p-4 shadow-xl shadow-black/10">
+                <div className="mb-3 flex items-start justify-between gap-3">
+                  <div><div className="text-xs font-semibold uppercase tracking-wider text-amber-400">{car.make || "Unknown make"}</div><h2 className="mt-1 text-lg font-bold">{car.model || "Unnamed model"}</h2></div>
+                  <div className="flex gap-1"><button onClick={() => editEntry(car)} className="rounded-lg p-2 text-slate-300 hover:bg-slate-800" aria-label="Edit"><Pencil size={17}/></button><button onClick={() => removeEntry(car.id)} className="rounded-lg p-2 text-rose-400 hover:bg-slate-800" aria-label="Delete"><Trash2 size={17}/></button></div>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-sm">
+                  <Fact label="Car year" value={car.vehicleYear}/><Fact label="Scale" value={car.scale}/><Fact label="Model made" value={car.modelProductionYear}/><Fact label="Manufacturer" value={car.modelManufacturer}/>
+                </div>
+                {car.notes && <p className="mt-3 border-t border-slate-800 pt-3 text-sm text-slate-400">{car.notes}</p>}
+              </article>
+            ))}
+          </div>
+        )}
+      </main>
+
+      {editing && (
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-black/75 p-3 sm:p-6">
+          <form onSubmit={saveEntry} className="mx-auto max-w-2xl rounded-3xl border border-slate-700 bg-slate-900 shadow-2xl">
+            <div className="sticky top-0 z-10 flex items-center justify-between rounded-t-3xl border-b border-slate-800 bg-slate-900 px-5 py-4">
+              <div><h2 className="text-xl font-bold">{form.id ? "Edit model car" : "Add model car"}</h2><p className="text-xs text-slate-400">All detected values remain editable.</p></div>
+              <button type="button" onClick={() => setEditing(false)} className="rounded-xl p-2 hover:bg-slate-800"><X/></button>
+            </div>
+
+            <div className="space-y-5 p-5">
+              <div className="rounded-2xl border border-dashed border-amber-500/50 bg-amber-950/20 p-4">
+                <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl bg-amber-400 px-4 py-3 font-semibold text-slate-950">
+                  <Camera size={20}/> Photograph underside
+                  <input type="file" accept="image/*" capture="environment" className="hidden" onChange={(e) => scanImage(e.target.files?.[0])}/>
+                </label>
+                <p className="mt-2 text-center text-xs text-slate-400">Use bright, even light. Keep embossed text level and fill the frame.</p>
+                {imageUrl && <img src={imageUrl} alt="Selected model car underside" className="mt-4 max-h-56 w-full rounded-xl bg-black object-contain"/>}
+                {ocrStatus && <div className="mt-3"><div className="mb-1 flex justify-between text-xs text-slate-300"><span>{ocrStatus}</span><span>{ocrProgress}%</span></div><div className="h-2 overflow-hidden rounded-full bg-slate-800"><div className="h-full bg-amber-400 transition-all" style={{width:`${ocrProgress}%`}}/></div></div>}
+              </div>
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="Vehicle make" value={form.make} onChange={(v) => update("make", v)} placeholder="e.g. Porsche" />
+                <Field label="Vehicle model" value={form.model} onChange={(v) => update("model", v)} placeholder="e.g. 911 Carrera" />
+                <Field label="Vehicle year" value={form.vehicleYear} onChange={(v) => update("vehicleYear", v)} inputMode="numeric" placeholder="e.g. 1973" />
+                <Field label="Scale" value={form.scale} onChange={(v) => update("scale", v)} placeholder="e.g. 1:64" />
+                <Field label="Scale model production year" value={form.modelProductionYear} onChange={(v) => update("modelProductionYear", v)} inputMode="numeric" placeholder="Optional" />
+                <Field label="Scale model manufacturer" value={form.modelManufacturer} onChange={(v) => update("modelManufacturer", v)} placeholder="e.g. Matchbox" />
+              </div>
+              <label className="block"><span className="mb-1.5 block text-sm font-medium text-slate-300">Notes</span><textarea value={form.notes} onChange={(e) => update("notes", e.target.value)} rows={3} className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 outline-none focus:border-amber-400" placeholder="Condition, color, series, catalog number…"/></label>
+              {form.rawOcr && <details className="rounded-xl border border-slate-800 bg-slate-950 p-3"><summary className="cursor-pointer text-sm font-medium text-slate-300">Raw OCR text</summary><textarea value={form.rawOcr} onChange={(e) => update("rawOcr", e.target.value)} rows={5} className="mt-3 w-full rounded-lg border border-slate-800 bg-slate-900 p-3 font-mono text-xs text-slate-300"/></details>}
+            </div>
+
+            <div className="sticky bottom-0 flex gap-3 rounded-b-3xl border-t border-slate-800 bg-slate-900 p-4">
+              <button type="button" onClick={() => setEditing(false)} className="flex-1 rounded-xl border border-slate-700 px-4 py-3 font-semibold">Cancel</button>
+              <button type="submit" className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-amber-400 px-4 py-3 font-semibold text-slate-950"><Save size={18}/> Save entry</button>
+            </div>
+          </form>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Field({ label, value, onChange, placeholder, inputMode }) {
+  return <label className="block"><span className="mb-1.5 block text-sm font-medium text-slate-300">{label}</span><input value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} inputMode={inputMode} className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 outline-none focus:border-amber-400"/></label>;
+}
+
+function Fact({ label, value }) {
+  return <div className="rounded-xl bg-slate-950 p-2.5"><div className="text-[11px] uppercase tracking-wide text-slate-500">{label}</div><div className="mt-0.5 truncate font-medium text-slate-200">{value || "—"}</div></div>;
+}
